@@ -252,49 +252,26 @@ app.get('/topsell', async (req, res) => {
 
 app.post("/code", async (req, res) => {
   const { uid, code } = req.body;
-
-  if (!uid || !code) {
-    return res.status(400).json({ error: "กรุณาส่ง uid และ code" });
-  }
+  if (!uid || !code) return res.status(400).json({ error: "กรุณาส่ง uid และ code" });
 
   try {
-    // ดึงข้อมูลโค้ด
     const [rows] = await db.query("SELECT * FROM codes WHERE codename = ?", [code]);
+
     if (rows.length === 0) {
       return res.status(400).json({ error: "ไม่พบโค้ดนี้" });
     }
 
     const codeData = rows[0];
-
-    // ✅ แปลง user_use จาก JSON เป็น array (ถ้า null ให้เริ่มเป็น array ว่าง)
     let usedList = [];
-    if (codeData.user_use) {
-      try {
-        usedList = JSON.parse(codeData.user_use);
-      } catch {
-        // ถ้า parse ไม่ได้ เช่นเก็บผิดรูปแบบ ก็เริ่มใหม่
-        usedList = [];
-      }
-    }
+    try { usedList = JSON.parse(codeData.user_use || "[]"); } catch { usedList = []; }
 
-    // ตรวจสอบว่า uid นี้ใช้แล้วหรือยัง
-    if (usedList.includes(String(uid))) {
+    if (usedList.includes(uid)) {
       return res.status(400).json({ error: "คุณใช้โค้ดนี้ไปแล้ว" });
     }
 
-    // ✅ เพิ่ม uid ใหม่เข้าไปใน array
-    usedList.push(String(uid));
-
-    // ✅ บันทึกกลับ DB เป็น JSON string
-    await db.query(
-      "UPDATE codes SET user_use = ? WHERE codename = ?",
-      [JSON.stringify(usedList), code]
-    );
-
-    // ส่งเปอร์เซ็นต์ส่วนลดกลับ
     const persen = Number(codeData.persen || 0);
-    res.json({ message: "โค้ดผ่าน", persen });
 
+    res.json({ message: "โค้ดผ่าน", persen });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
@@ -310,10 +287,9 @@ app.post("/buygame", async (req, res) => {
   }
 
   try {
-    // ตรวจสอบ wallet
+    // 1. ตรวจสอบ wallet
     const [userRows] = await db.query("SELECT wallet FROM users WHERE uid = ?", [uid]);
     if (!userRows || userRows.length === 0) return res.status(404).json({ error: "ไม่พบผู้ใช้" });
-
     const userWallet = Number(userRows[0].wallet || 0);
     const purchaseTotal = Number(totalPrice || 0);
 
@@ -321,15 +297,17 @@ app.post("/buygame", async (req, res) => {
       return res.status(400).json({ error: "ยอดเงินในกระเป๋าไม่เพียงพอ" });
     }
 
-    // ตรวจสอบ duplicate เกม
+    // 2. ตรวจสอบ duplicate เกม
     const [rows] = await db.query("SELECT game_all FROM orders WHERE user_id = ?", [uid]);
     const purchasedGameIds = new Set();
 
     rows.forEach(row => {
       let ids = [];
       try {
-        const parsed = JSON.parse(row.game_all || "[]");
-        if (Array.isArray(parsed)) ids = parsed.map(id => String(id)); // แปลงเป็น string
+        if (typeof row.game_all === "string") {
+          const parsed = JSON.parse(row.game_all);
+          if (Array.isArray(parsed)) ids = parsed.map(id => String(id));
+        }
       } catch {
         ids = [];
       }
@@ -343,10 +321,10 @@ app.post("/buygame", async (req, res) => {
       });
     }
 
-    // หัก wallet
+    // 3. หัก wallet
     await db.query("UPDATE users SET wallet = ? WHERE uid = ?", [userWallet - purchaseTotal, uid]);
 
-    // จัดการโค้ดส่วนลด
+    // 4. จัดการโค้ดส่วนลด
     if (discountCode) {
       const [codeRows] = await db.query("SELECT * FROM codes WHERE codename = ?", [discountCode]);
       if (codeRows.length > 0) {
@@ -362,21 +340,21 @@ app.post("/buygame", async (req, res) => {
       }
     }
 
-    // บันทึก order ใหม่
+    // 5. บันทึก order ใหม่
     const orderDate = new Date();
-    const gameIdsArray = games.map(g => String(g.game_id)); // string array
+    const gameIdsArray = games.map(g => g.game_id); // JSON array
 
     await db.query(
       "INSERT INTO orders (user_id, amount, game_all, order_date) VALUES (?, ?, ?, ?)",
       [uid, games.length, JSON.stringify(gameIdsArray), orderDate]
     );
 
-    // ส่ง response
+    // 6. ส่ง response
     res.json({
       message: "ซื้อเกมสำเร็จ",
       totalPrice: purchaseTotal,
       newWallet: userWallet - purchaseTotal,
-      games: games.map(g => ({ game_id: String(g.game_id), game_name: g.game_name, image: g.image }))
+      games: games.map(g => ({ game_id: g.game_id, game_name: g.game_name, image: g.image }))
     });
 
   } catch (err) {
@@ -384,70 +362,6 @@ app.post("/buygame", async (req, res) => {
     res.status(500).json({ error: "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์" });
   }
 });
-
-app.get("/mygame", async (req, res) => {
-  const uid = req.query.uid;
-  if (!uid) return res.status(400).json({ error: "กรุณาส่ง uid" });
-
-  try {
-    // 1. ดึง order ของ user
-    const [orders] = await db.query(
-      "SELECT game_all, order_date FROM orders WHERE user_id = ?",
-      [uid]
-    );
-
-    // 2. รวม game_id ทั้งหมดจากทุก order
-    const gameIds = [];
-    orders.forEach(order => {
-      try {
-        const ids = JSON.parse(order.game_all || "[]");
-        if (Array.isArray(ids)) ids.forEach(id => gameIds.push(String(id)));
-      } catch {}
-    });
-
-    if (gameIds.length === 0) return res.json({ games: [] });
-
-    // 3. ดึงรายละเอียดเกมและ category
-    const [games] = await db.query(
-      `SELECT g.*, c.type as category 
-       FROM games g
-       LEFT JOIN category c ON g.category_id = c.category_id
-       WHERE g.game_id IN (?)`,
-      [gameIds]
-    );
-
-    // 4. รวม order_date จาก orders
-    const gamesWithDate = games.map(g => {
-      let purchasedDate = null;
-      for (const order of orders) {
-        try {
-          const ids = JSON.parse(order.game_all || "[]");
-          if (Array.isArray(ids) && ids.includes(String(g.game_id))) {
-            purchasedDate = order.order_date;
-            break;
-          }
-        } catch {}
-      }
-      return {
-        game_id: String(g.game_id),
-        game_name: g.game_name,
-        price: g.price,
-        category: g.category,   // category type
-        description: g.description,
-        release_date: g.release_date,
-        image: g.image
-      };
-    });
-
-    res.json({ games: gamesWithDate });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์" });
-  }
-});
-
-
 
 // ------------------- เติมเงิน -------------------
 app.post("/wallet", async (req, res) => {
